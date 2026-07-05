@@ -1,22 +1,32 @@
-# Secrets
+# ── Secrets & data (NEVER commit) ──
 .env
-
-# Virtual environment
-onvif_env/
-venv/
-env/
-__pycache__/
-*.pyc
-
-# Model & database files (large binaries)
-*.engine
 *.pkl
-*.pt
-
-# Runtime files
-/tmp/
-*.jpg
-*.png
+face_db.pkl
 intruder_log.json
+
+# ── Models & engines (large, device-specific) ──
+*.engine
+*.gguf
+models/
+known_faces/
+
+# ── Runtime artifacts / snapshots ──
 alert_*.jpg
 intruder_*.jpg
+surv_*.jpg
+surv_*.json
+*.log
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+onvif_env/
+venv/
+.venv/
+env/
+
+# ── OS / editor ──
+.DS_Store
+.vscode/
+.idea/
