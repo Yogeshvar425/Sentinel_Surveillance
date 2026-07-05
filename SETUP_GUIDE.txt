@@ -1,10 +1,13 @@
 ================================================================================
   SENTINEL SURVEILLANCE SYSTEM — COMPLETE SETUP & USAGE GUIDE
-  Version 3.10  |  Authors: Hemkesh & V S Yogeshvar
+  Version 0.1.0  |  Engine: surveillance4_1.py  |  Authors: Hemkesh & V S Yogeshvar
 ================================================================================
 
 This guide walks you through every step needed to get SENTINEL running on a
 fresh NVIDIA Jetson device or standard Linux machine.
+
+For the two harder build steps (TensorRT engine export + the llama.cpp
+unified-memory build/launch), see BUILD.md.
 
 --------------------------------------------------------------------------------
 SECTION 1 — PREREQUISITES
@@ -15,7 +18,7 @@ SECTION 1 — PREREQUISITES
   This project was developed and validated on:
     Board   : NVIDIA Jetson Orin Nano Super (8 GB)
     JetPack : 6.x
-    Camera  : Dahua RTSP IP Camera
+    Camera  : Imou Ranger S2 (ONVIF, 1080p, pan/tilt)
     Storage : microSD / NVMe SSD
 
   All performance figures and tuning recommendations in this guide are based
@@ -32,10 +35,17 @@ Software you need installed before starting:
   3. CUDA & TensorRT (Jetson — included with JetPack 6.x)
        Verify:  nvcc --version
 
-  4. llama.cpp with LFM2-VL model (local AI engine)
-       Build:   git clone https://github.com/ggerganov/llama.cpp
-                cd llama.cpp && cmake -B build -DGGML_CUDA=ON && cmake --build build
-       Model:   download lfm2-vl-1.6b-q4_K_M.gguf and place in ~/models/
+  4. llama.cpp with the LFM2-VL model (local AI engine)
+       See BUILD.md Part 2 for the full build. In short:
+         git clone https://github.com/ggml-org/llama.cpp
+         cd llama.cpp
+         cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87 -DLLAMA_CURL=ON
+         cmake --build build --config Release -j$(nproc)
+       Models (place in ~/models/lfm2-vl/):
+         LFM2-VL-1.6B-Q4_0.gguf          (base weights)
+         mmproj-LFM2-VL-1.6B-Q8_0.gguf   (vision projector — REQUIRED)
+       IMPORTANT: launch with GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 (see Section 6 /
+       BUILD.md) or the model will NOT load on the Jetson's shared memory.
 
   5. A Telegram Bot token
        - Open Telegram, search @BotFather
@@ -80,8 +90,6 @@ SECTION 2 — CAMERA SETUP
 
   Discovering RTSP URL for Unknown Cameras
   -----------------------------------------
-  If your camera's RTSP URL is not listed above, use one of these methods:
-
     Method 1 — ONVIF Device Manager (Windows GUI):
       Download from: https://sourceforge.net/projects/onvifdm/
       It auto-discovers all ONVIF cameras on your network and shows the URL.
@@ -109,6 +117,7 @@ SECTION 2 — CAMERA SETUP
   - Ensure faces are well-lit and cover at least 80x80 pixels in frame
   - Avoid backlighting (camera facing a bright window)
   - Use sub-stream (subtype=1) to reduce network and CPU load
+    (switch to subtype=0 / the main stream for sharper faces if CPU allows)
 
 --------------------------------------------------------------------------------
 SECTION 3 — INSTALLATION
@@ -121,26 +130,28 @@ Step 1 — Clone the repository
 Step 2 — Create a virtual environment
   python3 -m venv venv
   source venv/bin/activate          # Linux / Jetson
-  # On Windows: venv\Scripts\activate
 
 Step 3 — Install Python dependencies
   pip install -r requirements.txt
 
   NOTE for Jetson users:
-    Do NOT run "pip install opencv-python" — the JetPack OpenCV is GPU-
-    accelerated and pip would overwrite it with a CPU-only version.
+    Do NOT run "pip install opencv-python" (or torch / tensorflow) — JetPack's
+    builds are GPU-accelerated and pip would overwrite them with CPU-only wheels.
 
-Step 4 — Download YOLOv8 model
+Step 4 — Get the YOLOv8 model
   Option A — TensorRT engine (Jetson, fastest):
     pip install ultralytics
-    yolo export model=yolov8n.pt format=engine device=0
+    yolo export model=yolov8n.pt format=engine half=True device=0 imgsz=640
     mv yolov8n.engine ~/yolov8n.engine
+    (see BUILD.md Part 1 for details)
 
-  Option B — PyTorch weights (any machine, easier):
-    wget -O ~/yolov8n.pt https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt
-    # Then update YOLO_MODEL in .env to point to the .pt file
+  Option B — PyTorch weights (x86 / no TensorRT):
+    wget -O ~/yolov8n.pt \
+      https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt
+    Then set YOLO_MODEL = "~/yolov8n.pt" and device='cpu' at the top of
+    surveillance4_1.py (these are script constants, not .env variables).
 
-Step 5 — Download YuNet face detector (needed by DeepFace)
+Step 5 — Download YuNet face detector (used by DeepFace)
   mkdir -p ~/.deepface/weights
   wget -O ~/.deepface/weights/face_detection_yunet_2023mar.onnx \
     https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
@@ -152,137 +163,147 @@ SECTION 4 — BUILDING YOUR FACE DATABASE
 The face database tells SENTINEL who the "known" people are. Anyone not in it
 is classified as a Stranger.
 
-  1. Create a folder structure like this:
-       faces/
-         YourName/
-           photo1.jpg
-           photo2.jpg
-         FamilyMember/
-           photo1.jpg
-
+  1. Create a folder named known_faces/, one subfolder per person:
+       known_faces/
+         Hemkesh/   photo1.jpg  photo2.jpg
+         Yogesh/    photo1.jpg
        Tips for good photos:
-         - Clear face, good lighting
-         - At least 2–3 photos per person from slightly different angles
-         - Face should take up at least 30% of the frame
+         - Clear, front-facing, well-lit face
+         - At least 3–5 photos per person from slightly different angles
+         - Face should take up a good portion of the frame
 
-  2. Run the face database builder:
-       python build_face_db.py --input faces/ --output ~/face_db.pkl
+  2. Set the paths at the top of build_face_db.py:
+         KNOWN_FACES_DIR = ".../known_faces"
+         DB_PATH         = ".../face_db.pkl"
+     Then run (no command-line flags — paths are in the script):
+         python build_face_db.py
 
-  3. Verify it loaded correctly:
-       The surveillance script prints on startup:
+  3. Verify: the surveillance script prints on startup:
          "✅ 2 persons: ['Hemkesh', 'Yogesh']"
+
+  Note: embeddings are L2-normalised at build time; if you change the photos,
+  rebuild the DB so the match scores stay calibrated.
 
 --------------------------------------------------------------------------------
 SECTION 5 — CONFIGURATION (.env FILE)
 --------------------------------------------------------------------------------
 
-Copy the template and fill in your values:
-
+Copy the template and fill in your values (then lock permissions):
   cp .env.example .env
   nano .env
+  chmod 600 .env
 
-Variables explained:
+Variables (exactly what the code reads):
 
   RTSP_URL
-    Full URL to your camera's RTSP stream.
+    Full URL to your camera's RTSP stream. Quote it (the & needs quoting).
     Format:  rtsp://USERNAME:PASSWORD@CAMERA_IP:PORT/path
-
-    URL by camera model:
-
+    By camera model:
       Imou Ranger S2 (tested):
         rtsp://admin:PASSWORD@CAMERA_IP:554/cam/realmonitor?channel=1&subtype=1
-
       Dahua IPC Series:
         rtsp://admin:PASSWORD@CAMERA_IP:554/cam/realmonitor?channel=1&subtype=1
-
       Hikvision DS-2CD Series:
         rtsp://admin:PASSWORD@CAMERA_IP:554/Streaming/Channels/101
-
       Reolink RLC Series:
         rtsp://admin:PASSWORD@CAMERA_IP:554/h264Preview_01_sub
 
-      Generic ONVIF camera:
-        Use ONVIF Device Manager (Windows) or onvif-util (Linux) to
-        discover the stream URL automatically:
-          pip install onvif-zeep
-          python -c "from onvif import ONVIFCamera; ..."
-
-    Tip: Use subtype=1 (sub-stream) where available — lower resolution
-         reduces CPU load without affecting detection accuracy.
-
-  TELEGRAM_BOT_TOKEN
+  BOT_TOKEN
     The token from @BotFather. Looks like: 123456789:ABCdefGHI-jklMNOpqrSTUvwx
 
-  TELEGRAM_CHAT_ID
-    Your personal Telegram ID (get it from @userinfobot).
-    Can also be a group chat ID (prefix with -100 for supergroups).
+  CHAT_ID
+    Your personal Telegram ID (from @userinfobot). A group ID works too
+    (supergroups are prefixed with -100).
 
-  YOLO_MODEL
-    Full path to your YOLOv8 model file.
-    Default: ~/yolov8n.engine   (Jetson TensorRT)
-    x86:     ~/yolov8n.pt
+  DASH_USER
+    Dashboard login username (e.g. admin).
 
-  FACE_DB_PATH
-    Full path to the face_db.pkl file you built in Section 3.
-    Default: ~/face_db.pkl
+  DASH_PASS
+    Dashboard login password. REQUIRED — the dashboard rejects all requests
+    if this is unset (fail-closed, no default credential).
 
-  INTRUDER_LOG
-    Where the JSON event log is saved.
-    Default: ~/intruder_log.json
+  Example .env:
+    RTSP_URL="rtsp://admin:PASSWORD@CAMERA_IP:554/cam/realmonitor?channel=1&subtype=1"
+    BOT_TOKEN=123456789:ABCdefGHI-jklMNOpqrSTUvwx
+    CHAT_ID=1223049319
+    DASH_USER=admin
+    DASH_PASS=choose-a-strong-one
+
+  Paths set in the SCRIPT (not .env):
+    YOLO_MODEL, FACE_DB_PATH, INTRUDER_LOG are constants at the top of
+    surveillance4_1.py — edit them there.
 
 --------------------------------------------------------------------------------
 SECTION 6 — RUNNING SENTINEL
 --------------------------------------------------------------------------------
 
-You need TWO terminal windows (or use tmux / screen).
+  On 8 GB the three processes are memory-tight. Two rules keep them alive:
+    (1) run headless   — free the desktop GUI (~2.5 GB)
+    (2) llama FIRST    — start the VLM before the engine so it claims GPU memory
 
-  Terminal 1 — Start the AI Vision Engine (LFM2-VL)
-  -------------------------------------------------
-  ~/llama.cpp/build/bin/llama-server \
-      -m ~/models/lfm2-vl-1.6b-q4_K_M.gguf \
-      --port 8080 \
-      --n-gpu-layers 999 \
-      --ctx-size 2048
+  EASIEST — one command (does headless + correct order + tmux):
+  -------------------------------------------------------------
+    ./start_sentinel.sh
+    Then open the dashboard (below).
 
-  Wait until you see: "llama server listening"
+  MANUAL — three terminals (or tmux windows), in this order:
+  ----------------------------------------------------------
+  First, go headless (frees RAM):
+    sudo systemctl stop display-manager
 
-  Terminal 2 — Start the Surveillance Engine
-  ------------------------------------------
-  source venv/bin/activate
-  python surveillance3_10.py
+  Terminal 1 — AI Vision Engine (LFM2-VL) — START THIS FIRST
+    GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 ~/llama.cpp/build/bin/llama-server \
+        --model  ~/models/lfm2-vl/LFM2-VL-1.6B-Q4_0.gguf \
+        --mmproj ~/models/lfm2-vl/mmproj-LFM2-VL-1.6B-Q8_0.gguf \
+        --host 127.0.0.1 --port 8080 \
+        --n-gpu-layers 999 --ctx-size 2048 --parallel 1
+    Wait until you see: "server is listening on http://127.0.0.1:8080"
+    (GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 and --mmproj are BOTH required.)
 
-  You will see:
-    Loading face database...
-    ✅ 2 persons: ['Hemkesh', 'Yogesh']
-    Loading YOLO...
-    Loading DeepFace...
-    Warming up LFM2-VL...
-    ✅ LFM2-VL ready!
-    🟢 Surveillance + LFM2-VL started!
+  Terminal 2 — Surveillance Engine (only after llama is listening)
+    source venv/bin/activate
+    python surveillance4_1.py
+    You will see:
+      [INIT] TensorFlow pinned to CPU; GPU reserved for YOLO/llama
+      [MODE] HEADLESS (no window)
+      Loading face database...
+      ✅ 2 persons: ['Hemkesh', 'Yogesh']
+      Loading YOLO...
+      Loading DeepFace...
+      Warming up LFM2-VL...
+      ✅ LFM2-VL ready!
+      🟢 Surveillance + LFM2-VL started!
+    (For a local preview window on a machine with a display: add --display.)
 
-  Terminal 3 — Start the Web Dashboard
-  -------------------------------------
-  source venv/bin/activate
-  python dashboard.py
+  Terminal 3 — Web Dashboard
+    source venv/bin/activate
+    python dashboard.py
 
-  Open in your browser:
+  Open in your browser (use Chrome — Safari renders MJPEG unreliably):
     Same device:   http://localhost:5000
     Phone / iPad:  http://YOUR_JETSON_IP:5000
+    Login:         DASH_USER / DASH_PASS  (from your .env)
 
   To find your Jetson IP:
     hostname -I | awk '{print $1}'
+
+  Stop everything:  tmux kill-server   (then: sudo systemctl start display-manager
+                    if you want the desktop back)
 
 --------------------------------------------------------------------------------
 SECTION 7 — USING THE DASHBOARD
 --------------------------------------------------------------------------------
 
+  LOGIN
+    You'll be prompted for DASH_USER / DASH_PASS on first load.
+
   LIVE FEED
-    The top of the page shows a live MJPEG stream from your camera.
-    The feed auto-reconnects if the connection drops.
+    The top of the page shows a live MJPEG stream. It auto-reconnects if the
+    connection drops. Use Chrome for reliable playback.
 
   STATUS BAR
     Shows one of: MONITORING / KNOWN / STRANGER / INTRUDER / FIRE!
-    FPS counter is shown on the right.
+    FPS counter on the right.
 
   CARDS
     Threat level (none / low / medium / high)
@@ -290,23 +311,23 @@ SECTION 7 — USING THE DASHBOARD
     Person count (detected in current frame)
 
   DETECTED PERSONS
-    Green chip = known face (name + confidence score)
+    Green chip = known face (name + confidence score, e.g. 0.79)
     Red chip   = stranger or unidentified
+    Known faces stay locked until they leave frame; Stranger verdicts are
+    re-checked every ~5 s.
 
   LIVE AI ANALYSIS
-    10-word scene description from LFM2-VL, updated every 4 seconds.
+    ~10-word scene description from LFM2-VL, updated every 4 seconds.
 
   NEURAL ASSISTANT (AI Chat)
-    Type any question about the live scene:
-      "Who is in the room?"
-      "Is anyone behaving suspiciously?"
+    Ask about the live scene:
+      "Who is in the room?"  /  "Is anyone behaving suspiciously?"
       "Describe what you see"
-    The AI analyses the current camera frame and responds.
+    The AI analyses the current frame and responds.
 
   EVENT LOG
-    Chronological list of all detected events.
-    Filter by: ALL / HIGH / MED / LOW / INFO
-    Last 12 events are shown (full log saved to intruder_log.json).
+    Chronological events. Filter: ALL / HIGH / MED / LOW / INFO.
+    Last 12 shown (full log in intruder_log.json).
 
   HEALTH BAR (bottom)
     CAMERA  — green if FPS > 0
@@ -318,30 +339,25 @@ SECTION 7 — USING THE DASHBOARD
 SECTION 8 — TELEGRAM ALERTS
 --------------------------------------------------------------------------------
 
-SENTINEL sends you a Telegram message with a photo for:
-
   Priority 1 (immediate, 30s cooldown)
     🔥 Fire or smoke detected by LFM2-VL
-
   Priority 2 (10s cooldown)
     ⚠️  High or medium threat detected
     🚨  Stranger detected during restricted hours (22:00 – 06:00)
-
   Priority 3
     ✅  System online notification on startup
 
-To test your bot:
-  Open Telegram → search your bot by name → send /start
-  Then trigger a detection (walk in front of the camera as a stranger).
+  To test: open Telegram → search your bot → send /start, then walk in front
+  of the camera as a stranger during restricted hours to trigger an alert.
 
 --------------------------------------------------------------------------------
 SECTION 9 — TUNING & TIPS
 --------------------------------------------------------------------------------
 
   Poor face recognition?
-    - Add more reference photos per person (aim for 5+)
-    - Ensure good lighting in the camera's field of view
-    - Lower FACE_MATCH_THRESH in surveillance3_10.py (e.g. 0.35)
+    - Add more reference photos per person (5+), rebuild the DB
+    - Ensure good lighting; use the main stream (subtype=0) for more face pixels
+    - Lower FACE_MATCH_THRESH in surveillance4_1.py (e.g. 0.35)
     - Increase FACE_MAX_RETRIES for harder faces
 
   Too many false Stranger alerts?
@@ -350,78 +366,78 @@ SECTION 9 — TUNING & TIPS
 
   High CPU / thermal throttling on Jetson?
     - Increase YOLO_FRAME_SKIP (default 2) to process fewer frames
-    - Increase LFM2_INTERVAL (default 4.0 seconds) for less AI load
-    - Reduce LFM2_IMG_W / LFM2_IMG_H for smaller images sent to LFM2
+    - Increase LFM2_INTERVAL (default 4.0 s) for less AI load
+    - Reduce LFM2_IMG_W / LFM2_IMG_H (images sent to LFM2)
 
   Dashboard stream laggy?
-    - Lower DISPLAY_WIDTH / DISPLAY_HEIGHT in surveillance3_10.py
-    - Reduce MJPEG quality in frame_feeder (change IMWRITE_JPEG_QUALITY)
+    - Lower DISPLAY_WIDTH / DISPLAY_HEIGHT in surveillance4_1.py
+    - Reduce the frame JPEG quality (IMWRITE_JPEG_QUALITY in the frame-write block)
+
+  Memory / OOM (three models on 8 GB)?
+    - Run headless (stop display-manager) and start llama FIRST
+    - Keep llama at --ctx-size 2048 --parallel 1
+    - See BUILD.md troubleshooting
 
   Camera disconnects frequently?
-    - FrameReader auto-reconnects after 2 seconds
-    - Check your network stability and camera firmware
+    - FrameReader auto-reconnects after 2 s
+    - Check network stability and camera firmware
 
 --------------------------------------------------------------------------------
 SECTION 10 — RUNNING ON STARTUP (SYSTEMD)
 --------------------------------------------------------------------------------
 
-To start SENTINEL automatically on boot:
+  Create one unit per process (llama first). Example for the engine:
 
-  1. Create /etc/systemd/system/sentinel.service:
+    /etc/systemd/system/sentinel-engine.service
+    -------------------------------------------
+      [Unit]
+      Description=SENTINEL Surveillance Engine
+      After=network.target sentinel-llm.service
+      Requires=sentinel-llm.service
 
-       [Unit]
-       Description=SENTINEL Surveillance Engine
-       After=network.target
+      [Service]
+      User=YOUR_USERNAME
+      WorkingDirectory=/path/to/Sentinel_Surveillance
+      ExecStart=/path/to/venv/bin/python surveillance4_1.py
+      Restart=on-failure
+      RestartSec=5
 
-       [Service]
-       User=YOUR_USERNAME
-       WorkingDirectory=/path/to/Sentinel_Surveillance
-       ExecStart=/path/to/venv/bin/python surveillance3_10.py
-       Restart=always
-       RestartSec=5
+      [Install]
+      WantedBy=multi-user.target
 
-       [Install]
-       WantedBy=multi-user.target
+  Enable and start:
+    sudo systemctl daemon-reload
+    sudo systemctl enable sentinel-engine
+    sudo systemctl start sentinel-engine
+    sudo systemctl status sentinel-engine
 
-  2. Enable and start:
-       sudo systemctl daemon-reload
-       sudo systemctl enable sentinel
-       sudo systemctl start sentinel
-       sudo systemctl status sentinel
-
-  Repeat with a separate .service file for dashboard.py and llama-server.
+  Repeat with sentinel-llm.service (llama-server, with
+  Environment=GGML_CUDA_ENABLE_UNIFIED_MEMORY=1) and sentinel-dashboard.service.
+  Order the After=/Requires= so llama starts first.
 
 --------------------------------------------------------------------------------
 SECTION 11 — TROUBLESHOOTING
 --------------------------------------------------------------------------------
 
-  "No module named 'dotenv'"
-    pip install python-dotenv
-
-  "RTSP stream not opening"
-    - Check the camera IP and credentials
-    - Try the URL in VLC first: Media → Open Network Stream → paste URL
-    - Ensure your device is on the same network as the camera
-
-  "LFM2-VL warmup failed"
-    - Make sure llama-server is running on port 8080
-    - Check: curl http://localhost:8080/health
-
-  "face_db.pkl not found"
-    - Build the database first (Section 3)
-    - Check the FACE_DB_PATH in your .env
-
-  "ImportError: libcuda.so not found"
-    - Source JetPack environment: source /opt/ros/... or check /usr/local/cuda
-
-  Dashboard shows "OFFLINE"
-    - surveillance3_10.py must be running to write /tmp/surv_state.json
-    - Start the engine first, then the dashboard
+  "No module named 'dotenv'"          → pip install python-dotenv
+  "Missing secrets ... RTSP_URL"      → .env not found or not loaded; run from
+                                         the repo dir, or install python-dotenv
+  "RTSP stream not opening"           → check IP/credentials; test the URL in VLC;
+                                         same network as the camera
+  llama: cudaMalloc failed / OOM      → prepend GGML_CUDA_ENABLE_UNIFIED_MEMORY=1;
+                                         go headless; start llama before the engine
+  "LFM2-VL warmup failed" / chat 111  → llama-server not up; curl http://127.0.0.1:8080/health
+  Scene analysis empty / text-only    → --mmproj not passed or wrong file
+  YOLO: Invalid CUDA 'device=0'       → don't set CUDA_VISIBLE_DEVICES=""; if torch
+                                         can't see CUDA after crashes, REBOOT
+  "face_db.pkl not found"             → build it (Section 4); check FACE_DB_PATH
+  Dashboard "OFFLINE" / blank video   → surveillance4_1.py must be running (writes
+                                         /tmp/surv_state.json + surv_frame.jpg);
+                                         start the engine first; use Chrome
+  Dashboard 401 / can't log in        → set DASH_PASS in .env (fail-closed)
 
 --------------------------------------------------------------------------------
-
   Repository:  https://github.com/hemkesh2021-dotcom/Sentinel_Surveillance
   Authors:     Hemkesh (hemkesh.2021@gmail.com)
                V S Yogeshvar (vsyogeshvar425@gmail.com)
-
 ================================================================================
