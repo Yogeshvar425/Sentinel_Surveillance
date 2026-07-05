@@ -7,18 +7,51 @@ Changes vs v3:
   - Categorized suggestion chips (ID / Threat / Scene)
   - Context tags on AI replies (Jessica, Stranger, Scene, etc.)
   - Modern pill input with circular send button
+
+SECURITY PATCHES:
+  - Patch 0: secrets/config from .env
+  - Patch 2: model-output HTML-escaped in the browser (XSS)
+  - Patch 5: HTTP Basic Auth on every route (set DASH_PASS in .env)
 """
 
-import os, json, time, threading, base64, requests
+import os, json, time, threading, base64, requests, hmac
+from functools import wraps
 from flask import Flask, Response, jsonify, render_template_string, request as freq
 
-HOME_DIR     = os.path.expanduser("~")
+# PATCH 0: load DASH_USER / DASH_PASS (and anything else) from .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 STATE_FILE   = "/tmp/surv_state.json"
 FRAME_FILE   = "/tmp/surv_frame.jpg"
-INTRUDER_LOG = os.path.join(HOME_DIR, "intruder_log.json")
+INTRUDER_LOG = "/home/villain8001/intruder_log.json"
 LFM2_SERVER  = "http://localhost:8080"
 
 app = Flask(__name__)
+
+# ══════════════════════════════════════════════════════════════
+# PATCH 5 — HTTP Basic Auth (covers page, MJPEG stream, and all fetch calls)
+# ══════════════════════════════════════════════════════════════
+DASH_USER = os.environ.get("DASH_USER", "admin")
+DASH_PASS = os.environ.get("DASH_PASS")          # no default → fail closed if unset
+
+def _check(u, p):
+    if not DASH_PASS:
+        return False
+    return hmac.compare_digest(u, DASH_USER) and hmac.compare_digest(p, DASH_PASS)
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        auth = freq.authorization
+        if not auth or not _check(auth.username or "", auth.password or ""):
+            return Response("Authentication required", 401,
+                            {"WWW-Authenticate": 'Basic realm="SENTINEL"'})
+        return f(*a, **kw)
+    return wrapper
 
 # ══════════════════════════════════════════════════════════════
 # DOUBLE-BUFFER FRAME STORE
@@ -486,6 +519,9 @@ body::after{
 // ── Clock ──
 setInterval(()=>{document.getElementById('clock').textContent=new Date().toTimeString().slice(0,8)},1000)
 
+// PATCH 2: HTML-escape helper — prevents model-output XSS anywhere we use innerHTML
+function esc(s){const d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML}
+
 // ── Feed reconnect ──
 let _frontImg='a',_errCount=0,_errTimer=null
 function activateFeed(id){
@@ -562,7 +598,7 @@ async function pollStatus(){
         if(p.name==='Checking...')
           return `<span class="chip ch-c"><span class="pip pc"></span>#${p.tid} Checking…</span>`
         const k=!p.stranger
-        return `<span class="chip ${k?'ch-k':'ch-s'}"><span class="pip ${k?'pk':'ps'}"></span>#${p.tid} ${p.name}${p.score>0?' ('+p.score+')':''}${k?' ✓':''}</span>`
+        return `<span class="chip ${k?'ch-k':'ch-s'}"><span class="pip ${k?'pk':'ps'}"></span>#${p.tid} ${esc(p.name)}${p.score>0?' ('+p.score+')':''}${k?' ✓':''}</span>`
       }).join('')
     }else{pl.innerHTML='<span class="no-p">No persons detected</span>'}
 
@@ -593,9 +629,9 @@ function renderLog(){
     const t=e.threat||'none',c=TK[t]||'#4a4035'
     const ts=(e.timestamp||'').split(' ')
     return `<div class="lentry">
-      <div class="ltime">${ts[1]||e.timestamp||''}<br><span style="font-size:7px">${ts[0]||''}</span></div>
+      <div class="ltime">${esc(ts[1]||e.timestamp||'')}<br><span style="font-size:7px">${esc(ts[0]||'')}</span></div>
       <div class="ltag" style="color:${c};border:1px solid ${c}33;background:${c}11">${t.toUpperCase()}</div>
-      <div class="ldesc">${e.description||'Stranger detected'}</div>
+      <div class="ldesc">${esc(e.description||'Stranger detected')}</div>
     </div>`
   }).join('')
 }
@@ -670,7 +706,7 @@ function addBubble(text,type){
         <span class="bubble-name">${isUser?'OPERATOR':isErr?'SYSTEM':'SENTINEL AI'}</span>
         <span class="bubble-time">${time}</span>
       </div>
-      <div class="bubble-text">${text}</div>
+      <div class="bubble-text">${esc(text)}</div>
       ${refsHtml}
     </div>`
   el.appendChild(d)
@@ -739,23 +775,28 @@ setInterval(pollLog,8000)
 
 # ── Routes ──
 @app.route('/')
+@require_auth
 def index():
     return render_template_string(HTML)
 
 @app.route('/stream')
+@require_auth
 def stream():
     return Response(generate_stream(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/status')
+@require_auth
 def status():
     return jsonify(read_state())
 
 @app.route('/log')
+@require_auth
 def log():
     return jsonify(read_log())
 
 @app.route('/chat', methods=['POST'])
+@require_auth
 def chat():
     data = freq.get_json(force=True) or {}
     question = data.get('message', '').strip()
@@ -766,6 +807,9 @@ def chat():
 
 
 if __name__ == '__main__':
+    if not DASH_PASS:
+        print("⚠  DASH_PASS is not set — every request will be rejected (401).")
+        print("   Set it first, e.g.:  export DASH_PASS='your-strong-passphrase'")
     print("🌐 SENTINEL Dashboard  →  http://0.0.0.0:5000")
     print("   iPhone / iPad       →  http://192.168.55.1:5000")
     app.run(host='0.0.0.0', port=5000, threaded=True)
