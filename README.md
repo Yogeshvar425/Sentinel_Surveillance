@@ -243,6 +243,12 @@ The `--mmproj` file is required — without it the server loads text-only and im
 
 ## Dashboard
 
+<div align="center">
+  <img src="dashboard_demo.png" alt="SENTINEL live dashboard" width="100%">
+  <p><em>The SENTINEL dashboard — live feed with detection box, threat / room / person cards,
+  live AI scene analysis, the Neural Assistant chat, and the filterable event log.</em></p>
+</div>
+
 ```
 ┌─────────────────────────────────────────┐
 │  ◉ SENTINEL              CAM-01  LIVE   │
