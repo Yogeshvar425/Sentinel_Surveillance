@@ -1,26 +1,36 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"]      = ""
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-os.environ["TF_GPU_ALLOCATOR"]          = "cuda_malloc_async"
+# Keep DeepFace/TensorFlow on the CPU (frees GPU memory for YOLO + llama-server) WITHOUT
+# hiding the GPU from PyTorch — yolo.track(device=0) needs torch.cuda to see it.
+# NOTE: the old CUDA_VISIBLE_DEVICES="" hid the GPU from torch too, which crashed YOLO.
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import tensorflow as _tf
+try:
+    _tf.config.set_visible_devices([], "GPU")   # TensorFlow/DeepFace = CPU only
+    print("[INIT] TensorFlow pinned to CPU; GPU reserved for YOLO/llama")
+except Exception as _e:
+    print(f"[WARN] could not pin TensorFlow to CPU: {_e}")
 
-import cv2, time, threading, numpy as np, pickle, json, base64, requests
+import cv2, time, threading, numpy as np, pickle, json, base64, requests, html
 from collections import defaultdict
 from ultralytics import YOLO
 from datetime import datetime
 from deepface import DeepFace
 from queue import Queue, Empty
-from dotenv import load_dotenv
+import argparse, signal, sys
 
-load_dotenv()
-
-HOME_DIR = os.path.expanduser("~")
+# PATCH 0: load secrets from .env (falls back to real env vars if python-dotenv absent)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ─── CONFIG ───────────────────────────────────────────
-RTSP_URL          = os.getenv("RTSP_URL", "rtsp://<user>:<pass>@<ip>:554/cam/realmonitor?channel=1&subtype=1")
-YOLO_MODEL        = os.getenv("YOLO_MODEL", os.path.join(HOME_DIR, "yolov8n.engine"))
-FACE_DB_PATH      = os.getenv("FACE_DB_PATH", os.path.join(HOME_DIR, "face_db.pkl"))
-BOT_TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID           = os.getenv("TELEGRAM_CHAT_ID", "")
+RTSP_URL          = os.environ.get("RTSP_URL")          # PATCH 0: from .env, not hardcoded
+YOLO_MODEL        = "/home/villain8001/yolov8n.engine"
+FACE_DB_PATH      = "/home/villain8001/face_db.pkl"
+BOT_TOKEN         = os.environ.get("BOT_TOKEN")         # PATCH 0
+CHAT_ID           = os.environ.get("CHAT_ID")           # PATCH 0
 DISPLAY_WIDTH     = 640
 DISPLAY_HEIGHT    = 480
 CONF_THRESHOLD    = 0.4
@@ -36,19 +46,44 @@ LFM2_INTERVAL     = 4.0
 LFM2_IMG_W        = 480
 LFM2_IMG_H        = 360
 LFM2_IMG_QUALITY  = 60
-INTRUDER_LOG      = os.getenv("INTRUDER_LOG", os.path.join(HOME_DIR, "intruder_log.json"))
+INTRUDER_LOG      = "/home/villain8001/intruder_log.json"
 STATE_FILE        = "/tmp/surv_state.json"
 FRAME_FILE        = "/tmp/surv_frame.jpg"
+
+# PATCH 0: fail fast with a clear message if secrets are missing
+if not all([RTSP_URL, BOT_TOKEN, CHAT_ID]):
+    raise SystemExit("Missing secrets: set RTSP_URL, BOT_TOKEN and CHAT_ID in .env "
+                     "(or export them) before running.")
+
+# PATCH 3.1: headless by default; pass --display (or SENTINEL_DISPLAY=1) to show the OpenCV window
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--display", action="store_true",
+                 help="show the live OpenCV preview window (needs a desktop/X display)")
+ARGS, _ = _ap.parse_known_args()
+SHOW_GUI = ARGS.display or os.environ.get("SENTINEL_DISPLAY") == "1"
+print(f"[MODE] {'DISPLAY (window on)' if SHOW_GUI else 'HEADLESS (no window)'}")
+
+# PATCH 3.1: clean shutdown on SIGTERM/SIGINT so systemd/tmux can stop it gracefully
+running = True
+def _handle_sig(signum, frame):
+    global running
+    running = False
+    print(f"\n[SHUTDOWN] signal {signum} received — stopping...")
+signal.signal(signal.SIGTERM, _handle_sig)
+signal.signal(signal.SIGINT, _handle_sig)
 
 # ── Face Re-ID config ──
 FACE_MAX_RETRIES  = 15      # more chances before giving up
 REID_THRESHOLD    = 0.48    # slightly lower than match threshold
 MAX_SESSION_EMBS  = 5       # embeddings stored per known person
+STRANGER_RECHECK  = 5.0     # re-verify a Stranger/Unknown track every N seconds
 
 # ── Load face DB ──
 print("Loading face database...")
 with open(FACE_DB_PATH, 'rb') as f:
     face_db = pickle.load(f)
+# PATCH 1: ensure every DB embedding is unit-norm (fixes deflated cosine scores; idempotent)
+face_db = {k: (v / np.linalg.norm(v)) for k, v in face_db.items() if np.linalg.norm(v) > 0}
 print(f"✅ {len(face_db)} persons: {list(face_db.keys())}")
 
 # ── Dashboard state ──
@@ -67,8 +102,13 @@ def update_dashboard(status, threat, description, persons, fire, fps, room_count
     if now - _last_state_write > 1.0:
         _last_state_write = now
         try:
-            with open(STATE_FILE,'w') as f: json.dump(dashboard_state,f)
-        except: pass
+            # PATCH 4: atomic write — dashboard never reads a half-written file
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, 'w') as f:
+                json.dump(dashboard_state, f)
+            os.replace(tmp, STATE_FILE)
+        except Exception:
+            pass
 
 # ── Intruder log ──
 log_lock = threading.Lock()
@@ -120,7 +160,7 @@ def send_alert(atype, priority=2, frame=None, caption=""):
     alert_cooldowns[atype] = now
     path = None
     if frame is not None:
-        path = os.path.join(HOME_DIR, f"alert_{atype}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+        path = f"/home/villain8001/alert_{atype}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         cv2.imwrite(path, frame)
     alert_queue.put_nowait((priority, atype, path, caption))
     print(f"[ALERT P{priority}] {atype}")
@@ -390,7 +430,11 @@ def update_tracks(boxes, frame_num):
             s.confirm_count=max(0,s.confirm_count-1)
             if frame_num-s.last_seen>PERSIST_FRAMES:
                 s.visible=False
-                if s.confirm_count==0: del track_states[tid]
+                if s.confirm_count==0:
+                    del track_states[tid]
+                    with verified_lock:
+                        verified_faces.pop(tid, None)   # forget identity so a returning person is re-checked
+                    face_retry_count.pop(tid, None)
     return [(tid,s) for tid,s in track_states.items() if s.visible and s.last_box is not None]
 
 # ── Entry/Exit Counter ──
@@ -428,8 +472,9 @@ bg_sub      = cv2.createBackgroundSubtractorMOG2(history=500,varThreshold=50,det
 frame_count = 0; fps_time=time.time(); fps=0
 track_list  = []; last_alert=0; last_fire=0; last_intruder_log=0
 face_thread_busy = False
+stranger_since = {}   # tid -> time it was first labelled Stranger (for periodic re-check)
 
-while True:
+while running:
     frame = reader.get()
     if frame is None: time.sleep(0.005); continue
 
@@ -438,8 +483,16 @@ while True:
     display = small.copy()
 
     if frame_count%3==0:
-        try: cv2.imwrite(FRAME_FILE,small,[cv2.IMWRITE_JPEG_QUALITY,70])
-        except: pass
+        try:
+            # atomic frame write — encode in memory so the temp file's extension is irrelevant
+            ok, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                tmp = FRAME_FILE + ".tmp"
+                with open(tmp, 'wb') as f:
+                    f.write(buf.tobytes())
+                os.replace(tmp, FRAME_FILE)
+        except Exception:
+            pass
 
     if frame_count%30==0:
         fps=30/(time.time()-fps_time); fps_time=time.time()
@@ -450,10 +503,13 @@ while True:
         track_list = update_tracks(results[0].boxes,frame_count)
 
     if not track_list:
-        cv2.putText(display,f"FPS:{fps:.1f} | IDLE — no persons",
-                    (10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
-        counter.draw(display); cv2.imshow("Surveillance",display)
-        if cv2.waitKey(1)&0xFF==ord('q'): break
+        if SHOW_GUI:
+            cv2.putText(display,f"FPS:{fps:.1f} | IDLE — no persons",
+                        (10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+            counter.draw(display); cv2.imshow("Surveillance",display)
+            if cv2.waitKey(1)&0xFF==ord('q'): break
+        else:
+            time.sleep(0.02)   # pace the loop when headless (no waitKey)
         continue
 
     any_stranger = False
@@ -480,6 +536,19 @@ while True:
                     if cur and cur[0]=="Stranger" and cur[1]==0.0:
                         del verified_faces[tid]
                         print(f"[FACE] #{tid} removed Stranger label — retrying")
+
+    # ── Periodically expire Stranger/Unknown verdicts so returning people get re-checked ──
+    _now = time.time()
+    with verified_lock:
+        for _tid in list(verified_faces.keys()):
+            _nm, _ = verified_faces[_tid]
+            if _nm in ("Stranger", "Unknown"):
+                stranger_since.setdefault(_tid, _now)
+                if _now - stranger_since[_tid] > STRANGER_RECHECK:
+                    del verified_faces[_tid]           # clear → re-checked this cycle
+                    stranger_since.pop(_tid, None)
+            else:
+                stranger_since.pop(_tid, None)
 
     # ── Spawn face recognition ──
     # Re-read verified_faces fresh here — not the stale vf_snap
@@ -542,7 +611,7 @@ while True:
             if now-last_alert>10:
                 last_alert=now
                 send_alert(f"THREAT_{threat.upper()}",2,small,
-                           f"⚠️ <b>THREAT:{threat.upper()}</b>\n🕐{datetime.now().strftime('%H:%M:%S')}\n🤖{desc}")
+                           f"⚠️ <b>THREAT:{threat.upper()}</b>\n🕐{datetime.now().strftime('%H:%M:%S')}\n🤖{html.escape(desc)}")
 
     # ── Intruder handling ──
     now=time.time()
@@ -552,7 +621,7 @@ while True:
             cur_desc  =str(last_ai_result.get('description') or '')
         if now-last_intruder_log>60:
             last_intruder_log=now
-            path=os.path.join(HOME_DIR, f"intruder_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg")
+            path=f"/home/villain8001/intruder_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             cv2.imwrite(path,small)
             threading.Thread(target=save_intruder_event,args=(path,cur_threat,cur_desc),daemon=True).start()
         if cur_threat in ['medium','high'] and is_restricted_time():
@@ -560,7 +629,7 @@ while True:
                 last_alert=now
                 send_alert("INTRUDER",2,small,
                            f"🚨 <b>INTRUDER — {cur_threat.upper()} THREAT</b>\n"
-                           f"🕐{datetime.now().strftime('%H:%M:%S')}\n🤖{cur_desc}\n"
+                           f"🕐{datetime.now().strftime('%H:%M:%S')}\n🤖{html.escape(cur_desc)}\n"
                            f"👥 Room:{max(0,counter.entries-counter.exits)}")
 
     # ── Recompute any_stranger after re-sync (verified_faces may have updated) ──
@@ -586,8 +655,18 @@ while True:
         _f=bool(last_ai_result.get('fire_smoke',False))
     update_dashboard(status,_t,_d,person_list,_f,fps,max(0,counter.entries-counter.exits))
 
-    cv2.imshow("Surveillance",display)
-    if cv2.waitKey(1)&0xFF==ord('q'): break
+    if SHOW_GUI:
+        cv2.imshow("Surveillance",display)
+        if cv2.waitKey(1)&0xFF==ord('q'): break
+    else:
+        time.sleep(0.001)   # yield when headless
 
+print("[SHUTDOWN] stopping reader and cleaning up...")
 reader.stop()
-cv2.destroyAllWindows()
+if SHOW_GUI:
+    cv2.destroyAllWindows()
+try:
+    send_message("🛑 <b>Surveillance stopped</b>")
+    time.sleep(1)   # give the alert worker a moment to flush the message
+except Exception:
+    pass
